@@ -224,3 +224,85 @@
         )
     )
 )
+
+;; Public Functions
+
+;; Create a new yield vault
+(define-public (create-vault
+        (name (string-ascii 64))
+        (risk-level uint)
+        (min-deposit uint)
+    )
+    (let (
+            (vault-id (+ (var-get vault-counter) u1))
+            (best-strategy (get-best-strategy risk-level))
+        )
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (not (var-get emergency-pause)) ERR_VAULT_PAUSED)
+        (asserts! (and (>= risk-level u1) (<= risk-level u3)) ERR_INVALID_AMOUNT)
+        ;; Create vault
+        (map-set vaults vault-id {
+            name: name,
+            asset: .stx-token, ;; Default to STX
+            total-shares: u0,
+            total-assets: u0,
+            strategy-id: best-strategy,
+            risk-level: risk-level,
+            min-deposit: min-deposit,
+            is-active: true,
+            created-at: stacks-block-height,
+            last-harvest: stacks-block-height,
+        })
+        ;; Set default strategy allocation
+        (map-set strategy-allocations {
+            vault-id: vault-id,
+            strategy-id: best-strategy,
+        }
+            u10000
+        )
+        ;; Update counter
+        (var-set vault-counter vault-id)
+        (ok vault-id)
+    )
+)
+
+;; Compound all earnings in a vault
+(define-public (harvest-vault (vault-id uint))
+    (let ((vault-data (unwrap! (map-get? vaults vault-id) ERR_VAULT_NOT_FOUND)))
+        (asserts! (not (var-get emergency-pause)) ERR_VAULT_PAUSED)
+        (asserts! (get is-active vault-data) ERR_VAULT_PAUSED)
+        ;; Compound earnings
+        (asserts! (compound-vault-earnings vault-id) (ok false))
+        (ok true)
+    )
+)
+
+;; Rebalance vault strategies (admin only)
+(define-public (rebalance-vault
+        (vault-id uint)
+        (new-strategy-id uint)
+    )
+    (let (
+            (vault-data (unwrap! (map-get? vaults vault-id) ERR_VAULT_NOT_FOUND))
+            (strategy-data (unwrap! (map-get? yield-strategies new-strategy-id)
+                ERR_STRATEGY_NOT_FOUND
+            ))
+        )
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active strategy-data) ERR_STRATEGY_INACTIVE)
+        ;; Harvest current position before rebalancing
+        (try! (harvest-vault vault-id))
+        ;; Update vault strategy
+        (map-set vaults vault-id
+            (merge vault-data { strategy-id: new-strategy-id })
+        )
+        ;; Update strategy allocation
+        (map-set strategy-allocations {
+            vault-id: vault-id,
+            strategy-id: new-strategy-id,
+        }
+            u10000
+        )
+        (ok true)
+    )
+)
