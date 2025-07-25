@@ -1,4 +1,4 @@
-;; StacksYield - Yield Aggregator Smart Contract
+;; StackVault - Yield Aggregator Smart Contract
 ;; Automatically finds and compounds the best yield opportunities across DeFi protocols
 
 ;; Constants
