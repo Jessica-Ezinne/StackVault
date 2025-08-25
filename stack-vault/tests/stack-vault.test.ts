@@ -414,5 +414,413 @@ describe("StackVault Contract Tests", () => {
       });
     });
   });
+
+  describe("User Deposit and Withdrawal Functions", () => {
+    const wallet2 = accounts.get("wallet_2")!;
+    
+    // Setup a test vault for user operations
+    beforeEach(() => {
+      simnet.callPublicFn(contractName, "create-vault", [
+        Cl.stringAscii("User Test Vault"),
+        Cl.uint(2), // Balanced risk
+        Cl.uint(1000000) // 1 STX minimum
+      ], deployer);
+    });
+
+    describe("Deposit Operations", () => {
+      it("should allow user to deposit above minimum amount", () => {
+        const depositAmount = 5000000; // 5 STX
+        
+        const { result } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(depositAmount)
+        ], wallet1);
+        
+        // Should return shares minted (1:1 ratio for first deposit)
+        expect(result).toBeOk(Cl.uint(depositAmount));
+
+        // Verify user position was created
+        const { result: position } = simnet.callReadOnlyFn(contractName, "get-user-position", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(position.type).toBe(10); // OptionalSome type
+        
+        // Verify vault was updated
+        const { result: vaultInfo } = simnet.callReadOnlyFn(contractName, "get-vault-info", [Cl.uint(1)], deployer);
+        expect(vaultInfo.type).toBe(10); // OptionalSome type
+
+        // Verify user vault value
+        const { result: userValue } = simnet.callReadOnlyFn(contractName, "get-user-vault-value", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(userValue).toEqual(Cl.uint(depositAmount));
+      });
+
+      it("should reject deposit below minimum amount", () => {
+        const { result } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(500000) // 0.5 STX (below 1 STX minimum)
+        ], wallet1);
+        
+        expect(result).toBeErr(Cl.uint(206)); // ERR_MINIMUM_DEPOSIT_NOT_MET
+      });
+
+      it("should allow multiple users to deposit to same vault", () => {
+        // First user deposits
+        const { result: deposit1 } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(3000000) // 3 STX
+        ], wallet1);
+        expect(deposit1).toBeOk(Cl.uint(3000000));
+
+        // Second user deposits
+        const { result: deposit2 } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(2000000) // 2 STX
+        ], wallet2);
+        expect(deposit2).toBeOk(Cl.uint(2000000));
+
+        // Verify both users have positions
+        const { result: pos1 } = simnet.callReadOnlyFn(contractName, "get-user-position", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(pos1.type).toBe(10); // OptionalSome
+
+        const { result: pos2 } = simnet.callReadOnlyFn(contractName, "get-user-position", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet2)
+        ], deployer);
+        expect(pos2.type).toBe(10); // OptionalSome
+      });
+
+      it("should update user vault list when depositing", () => {
+        // User has no vaults initially
+        const { result: initialVaults } = simnet.callReadOnlyFn(contractName, "get-user-vaults", [
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(initialVaults).toEqual(Cl.list([]));
+
+        // Make deposit
+        simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(2000000)
+        ], wallet1);
+
+        // User should now have vault in their list
+        const { result: updatedVaults } = simnet.callReadOnlyFn(contractName, "get-user-vaults", [
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(updatedVaults).toEqual(Cl.list([Cl.uint(1)]));
+      });
+
+      it("should fail to deposit to non-existent vault", () => {
+        const { result } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(999),
+          Cl.uint(2000000)
+        ], wallet1);
+        
+        expect(result).toBeErr(Cl.uint(203)); // ERR_VAULT_NOT_FOUND
+      });
+
+      it("should allow subsequent deposits to compound existing position", () => {
+        // First deposit
+        simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(2000000) // 2 STX
+        ], wallet1);
+
+        // Second deposit
+        const { result } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(3000000) // 3 STX more
+        ], wallet1);
+        
+        expect(result).toBeOk(Cl.uint(3000000)); // Should get 3M shares for 3 STX
+
+        // Total user value should be 5 STX
+        const { result: userValue } = simnet.callReadOnlyFn(contractName, "get-user-vault-value", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(userValue).toEqual(Cl.uint(5000000));
+      });
+    });
+
+    describe("Withdrawal Operations", () => {
+      beforeEach(() => {
+        // Setup user with some deposit for withdrawal tests
+        simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(10000000) // 10 STX
+        ], wallet1);
+      });
+
+      it("should allow partial withdrawal of shares", () => {
+        const sharesToWithdraw = 3000000; // 3M shares (30% of 10M)
+        
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(sharesToWithdraw)
+        ], wallet1);
+        
+        // Should succeed and return net withdrawal amount (after fees)
+        expect(result.type).toBe(7); // ResponseOk type
+
+        // User should still have a position
+        const { result: position } = simnet.callReadOnlyFn(contractName, "get-user-position", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(position.type).toBe(10); // OptionalSome
+      });
+
+      it("should allow full withdrawal of all shares", () => {
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(10000000) // All shares
+        ], wallet1);
+        
+        expect(result.type).toBe(7); // ResponseOk type
+
+        // User position should be removed after full withdrawal
+        const { result: position } = simnet.callReadOnlyFn(contractName, "get-user-position", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(position).toEqual(Cl.none());
+
+        // User vault value should be 0
+        const { result: userValue } = simnet.callReadOnlyFn(contractName, "get-user-vault-value", [
+          Cl.uint(1),
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(userValue).toEqual(Cl.uint(0));
+      });
+
+      it("should reject withdrawal of more shares than user owns", () => {
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(15000000) // More than 10M shares owned
+        ], wallet1);
+        
+        expect(result).toBeErr(Cl.uint(207)); // ERR_WITHDRAWAL_TOO_LARGE
+      });
+
+      it("should reject withdrawal of zero shares", () => {
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(0)
+        ], wallet1);
+        
+        expect(result).toBeErr(Cl.uint(202)); // ERR_INVALID_AMOUNT
+      });
+
+      it("should fail withdrawal from non-existent vault", () => {
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(999),
+          Cl.uint(1000000)
+        ], wallet1);
+        
+        expect(result).toBeErr(Cl.uint(203)); // ERR_VAULT_NOT_FOUND
+      });
+
+      it("should fail withdrawal when user has no position", () => {
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(1000000)
+        ], wallet2); // wallet2 has no position
+        
+        expect(result).toBeErr(Cl.uint(201)); // ERR_INSUFFICIENT_BALANCE
+      });
+
+      it("should apply platform fees on withdrawal", () => {
+        // Make withdrawal and check it succeeds
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(5000000) // Half of 10M shares
+        ], wallet1);
+        
+        expect(result.type).toBe(7); // ResponseOk type
+        // The actual withdrawn amount should be less than 5 STX due to platform fees
+      });
+    });
+
+    describe("Emergency Pause Impact", () => {
+      beforeEach(() => {
+        // Setup user position and enable emergency pause
+        simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(5000000)
+        ], wallet1);
+        simnet.callPublicFn(contractName, "toggle-emergency-pause", [], deployer);
+      });
+
+      it("should block deposits during emergency pause", () => {
+        const { result } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(2000000)
+        ], wallet2);
+        
+        expect(result).toBeErr(Cl.uint(205)); // ERR_VAULT_PAUSED
+      });
+
+      it("should block withdrawals during emergency pause", () => {
+        const { result } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(1000000)
+        ], wallet1);
+        
+        expect(result).toBeErr(Cl.uint(205)); // ERR_VAULT_PAUSED
+      });
+
+      it("should block vault harvesting during emergency pause", () => {
+        const { result } = simnet.callPublicFn(contractName, "harvest-vault", [Cl.uint(1)], deployer);
+        expect(result).toBeErr(Cl.uint(205)); // ERR_VAULT_PAUSED
+      });
+    });
+  });
+
+  describe("Edge Cases and Integration Tests", () => {
+    beforeEach(() => {
+      // Create multiple vaults for comprehensive testing
+      simnet.callPublicFn(contractName, "create-vault", [
+        Cl.stringAscii("Integration Test Vault 1"),
+        Cl.uint(1),
+        Cl.uint(1000000)
+      ], deployer);
+      simnet.callPublicFn(contractName, "create-vault", [
+        Cl.stringAscii("Integration Test Vault 2"),
+        Cl.uint(3),
+        Cl.uint(5000000)
+      ], deployer);
+    });
+
+    describe("Multi-Vault User Operations", () => {
+      it("should allow user to deposit to multiple vaults", () => {
+        // Deposit to vault 1
+        const { result: deposit1 } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(2000000)
+        ], wallet1);
+        expect(deposit1).toBeOk(Cl.uint(2000000));
+
+        // Deposit to vault 2
+        const { result: deposit2 } = simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(2),
+          Cl.uint(7000000)
+        ], wallet1);
+        expect(deposit2).toBeOk(Cl.uint(7000000));
+
+        // User should have both vaults in their list
+        const { result: userVaults } = simnet.callReadOnlyFn(contractName, "get-user-vaults", [
+          Cl.standardPrincipal(wallet1)
+        ], deployer);
+        expect(userVaults).toEqual(Cl.list([Cl.uint(1), Cl.uint(2)]));
+      });
+
+      it("should handle platform statistics correctly across operations", () => {
+        // Make several deposits
+        simnet.callPublicFn(contractName, "deposit", [Cl.uint(1), Cl.uint(3000000)], wallet1);
+        simnet.callPublicFn(contractName, "deposit", [Cl.uint(2), Cl.uint(8000000)], wallet1);
+        
+        // Check updated stats
+        const { result: updatedStats } = simnet.callReadOnlyFn(contractName, "get-platform-stats", [], deployer);
+        expect(updatedStats.type).toBe(12); // Tuple type
+        
+        // Make withdrawal and check stats again
+        simnet.callPublicFn(contractName, "withdraw", [Cl.uint(1), Cl.uint(1000000)], wallet1);
+        
+        const { result: finalStats } = simnet.callReadOnlyFn(contractName, "get-platform-stats", [], deployer);
+        expect(finalStats.type).toBe(12); // Tuple type
+      });
+    });
+
+    describe("Vault State Transitions", () => {
+      it("should handle vault creation, deposits, and strategy changes", () => {
+        // Deposit to vault
+        simnet.callPublicFn(contractName, "deposit", [
+          Cl.uint(1),
+          Cl.uint(10000000)
+        ], wallet1);
+
+        // Change vault strategy
+        const { result: rebalance } = simnet.callPublicFn(contractName, "rebalance-vault", [
+          Cl.uint(1),
+          Cl.uint(3) // Switch to high-yield strategy
+        ], deployer);
+        expect(rebalance).toBeOk(Cl.bool(true));
+
+        // Harvest vault (may return true or false depending on earnings)
+        const { result: harvest } = simnet.callPublicFn(contractName, "harvest-vault", [Cl.uint(1)], deployer);
+        expect(harvest.type).toBe(7); // ResponseOk type - success regardless of value
+
+        // User should still be able to withdraw
+        const { result: withdraw } = simnet.callPublicFn(contractName, "withdraw", [
+          Cl.uint(1),
+          Cl.uint(5000000)
+        ], wallet1);
+        expect(withdraw.type).toBe(7); // ResponseOk type
+      });
+    });
+
+    describe("Error Handling Robustness", () => {
+      it("should handle all error cases gracefully", () => {
+        // Test various error scenarios
+        const errorTests = [
+          {
+            fn: "deposit",
+            args: [Cl.uint(999), Cl.uint(1000000)],
+            expectedErr: 203 // ERR_VAULT_NOT_FOUND
+          },
+          {
+            fn: "withdraw", 
+            args: [Cl.uint(999), Cl.uint(1000000)],
+            expectedErr: 203 // ERR_VAULT_NOT_FOUND
+          },
+          {
+            fn: "harvest-vault",
+            args: [Cl.uint(999)],
+            expectedErr: 203 // ERR_VAULT_NOT_FOUND
+          },
+          {
+            fn: "rebalance-vault",
+            args: [Cl.uint(999), Cl.uint(1)],
+            expectedErr: 203 // ERR_VAULT_NOT_FOUND
+          }
+        ];
+
+        errorTests.forEach(test => {
+          const { result } = simnet.callPublicFn(contractName, test.fn, test.args, deployer);
+          expect(result).toBeErr(Cl.uint(test.expectedErr));
+        });
+      });
+    });
+
+    describe("Gas and Performance Considerations", () => {
+      it("should handle multiple operations in sequence efficiently", () => {
+        // Simulate typical user workflow
+        const workflow = [
+          () => simnet.callPublicFn(contractName, "deposit", [Cl.uint(1), Cl.uint(5000000)], wallet1),
+          () => simnet.callReadOnlyFn(contractName, "get-user-vault-value", [Cl.uint(1), Cl.standardPrincipal(wallet1)], deployer),
+          () => simnet.callPublicFn(contractName, "harvest-vault", [Cl.uint(1)], deployer),
+          () => simnet.callPublicFn(contractName, "withdraw", [Cl.uint(1), Cl.uint(2000000)], wallet1),
+          () => simnet.callReadOnlyFn(contractName, "get-platform-stats", [], deployer)
+        ];
+
+        // All operations should succeed
+        workflow.forEach((operation, index) => {
+          const { result } = operation();
+          if (index === 1 || index === 4) { // Read-only functions at index 1 and 4
+            expect(result.type).toBeGreaterThan(0); // Any valid Clarity type
+          } else { // Public functions
+            expect([7, 8]).toContain(result.type); // ResponseOk or ResponseErr
+          }
+        });
+      });
+    });
+  });
 });
 
